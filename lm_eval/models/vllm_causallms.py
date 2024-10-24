@@ -2,6 +2,7 @@ import copy
 from importlib.metadata import version
 from importlib.util import find_spec
 from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Tuple, Union
+import math
 
 from more_itertools import distribute
 from packaging.version import parse as parse_version
@@ -23,6 +24,8 @@ try:
     from vllm import LLM, SamplingParams
     from vllm.lora.request import LoRARequest
     from vllm.transformers_utils.tokenizer import get_tokenizer
+    from vllm import LLM, SamplingParams
+    from vllm.sequence import Logprob
 except ModuleNotFoundError:
     pass
 
@@ -30,7 +33,6 @@ if TYPE_CHECKING:
     pass
 
 eval_logger = eval_logger
-
 
 @register_model("vllm")
 class VLLM(TemplateLM):
@@ -49,20 +51,23 @@ class VLLM(TemplateLM):
         prefix_token_id: Optional[int] = None,
         tensor_parallel_size: int = 1,
         quantization: Optional[str] = None,
-        max_gen_toks: int = 256,
+        max_gen_toks: int = 4096,
         swap_space: int = 4,
         batch_size: Union[str, int] = 1,
         max_batch_size=None,
-        max_length: int = None,
+        max_length: int = 8192,
         max_model_len: int = None,
         seed: int = 1234,
         gpu_memory_utilization: float = 0.9,
         device: str = "cuda",
         data_parallel_size: int = 1,
         lora_local_path: str = None,
+        use_blueberry: bool = True,
         **kwargs,
     ):
         super().__init__()
+
+        self.use_blueberry = use_blueberry
 
         if not find_spec("vllm"):
             raise ModuleNotFoundError(
@@ -224,6 +229,24 @@ class VLLM(TemplateLM):
         stop: Optional[List[str]] = None,
         **kwargs,
     ):
+
+        if self.use_blueberry:
+
+            outputs = []
+            for req in requests:
+
+                output = self.generate_blueberry(
+                    req,
+                    system_prompt="you are a helpful assistant",
+                    use_tqdm=True if self.batch_size == "auto" else False,
+                )  
+
+                outputs.append(output)  
+
+            return outputs
+
+
+
         if generate:
             kwargs = self.modify_gen_kwargs(kwargs)
             sampling_params = SamplingParams(max_tokens=max_tokens, stop=stop, **kwargs)
@@ -231,6 +254,7 @@ class VLLM(TemplateLM):
             sampling_params = SamplingParams(
                 temperature=0, prompt_logprobs=1, max_tokens=1, detokenize=False
             )
+   
         if self.data_parallel_size > 1:
             # vLLM hangs if tensor_parallel > 1 and resources are set in ray.remote
             # also seems to only work with decorator and not with ray.remote() fn
@@ -311,10 +335,12 @@ class VLLM(TemplateLM):
     def generate_until(
         self, requests: List[Instance], disable_tqdm: bool = False
     ) -> List[str]:
+
         res = []
 
         # batch tokenize contexts
         context, all_gen_kwargs = zip(*(req.args for req in requests))
+
         context_encoding: List[List[int]] = self.tok_encode(
             context, add_special_tokens=self.add_bos_token
         )
@@ -344,6 +370,8 @@ class VLLM(TemplateLM):
             disable=(disable_tqdm or (self.rank != 0)),
             desc="Running generate_until requests",
         )
+
+ 
         # for each different set of kwargs, we execute all requests, by batch.
         for chunk in chunks:
             context_and_encoding, all_gen_kwargs = zip(*chunk)
@@ -394,14 +422,20 @@ class VLLM(TemplateLM):
 
             # cache generations
             for output, context in zip(cont, context):
-                generated_text = output.outputs[0].text
+
+                if self.use_blueberry:
+                    generated_text = output
+                else:
+                    generated_text = output.outputs[0].text
+                
+                    self.cache_hook.add_partial(
+                        "generate_until", (context, gen_kwargs), generated_text
+                    )
                 res.append(generated_text)
-                self.cache_hook.add_partial(
-                    "generate_until", (context, gen_kwargs), generated_text
-                )
                 pbar.update(1)
 
         pbar.close()
+        #exit("***")
         # reorder all group of results back to original unsorted form
         return re_ords.get_original(res)
 
@@ -539,3 +573,150 @@ class VLLM(TemplateLM):
             "spaces_between_special_tokens", False
         )
         return kwargs
+
+    # Define the TreeNode class
+    class TreeNode:
+        def __init__(self, text: str, input_ids: List[int], entropy_history: List[float]):
+            self.text = text  # Generated text after the prompt
+            self.input_ids = input_ids  # Token IDs of the full sequence (prompt + generated text)
+            self.entropy_history = entropy_history
+            self.children: List['TreeNode'] = []
+            self.total_entropy = sum(entropy_history)
+
+    # Define the calculate_ewma function
+    def calculate_ewma(self,history: List[float], alpha: float) -> float:
+        ewma = history[0]
+        for value in history[1:]:
+            ewma = alpha * value + (1 - alpha) * ewma
+        return ewma
+
+    # Define the calculate_std_entropy function
+    def calculate_std_entropy(self,history: List[float], ewma: float) -> float:
+        squared_diff_sum = sum((x - ewma) ** 2 for x in history)
+        return (squared_diff_sum / len(history)) ** 0.5
+
+    # Define the main generate function named generate_blueberry
+    def generate_blueberry(
+        self,
+        prompt_token_ids,
+        system_prompt: str,
+        use_tqdm=False,
+        alpha=0.1,
+        max_length=2048,
+        temperature=1,
+        beam_width=30,
+        k_steps=5
+    ):
+        system_prompt = "You are a helpful assistant"
+        # Decode the token IDs into the prompt text
+        prompt = self.tokenizer.decode(prompt_token_ids, skip_special_tokens=False)
+
+        # Apply the chat template to the prompt text
+        prompt_with_template = self.tokenizer.apply_chat_template([
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt}
+        ], tokenize=False, add_generation_prompt=True)
+
+        # Encode the prompt with template back into token IDs
+        input_ids = self.tokenizer.encode(prompt_with_template)
+
+        root = self.TreeNode("", input_ids, [])
+        leaves = [root]
+
+        sampling_params = SamplingParams(
+            temperature=temperature,
+            min_p=0.05,
+            max_tokens=k_steps,
+            logprobs=20
+        )
+
+        spike_count = 0
+
+        for _ in range(max_length // k_steps):
+            new_leaves = []
+            leaf_prompts = [
+                prompt_with_template + leaf.text for leaf in leaves
+                if self.tokenizer.eos_token not in leaf.text
+            ]
+
+            if not leaf_prompts:
+                break
+
+            outputs = self.model.generate(
+                leaf_prompts,
+                sampling_params=sampling_params,
+                use_tqdm=False
+            )
+
+            for leaf, output in zip(leaves, outputs):
+                if self.tokenizer.eos_token in leaf.text:
+                    new_leaves.append(leaf)
+                    continue
+
+                generated_text = output.outputs[0].text
+                logprobs_dicts = output.outputs[0].logprobs
+
+                # Calculate total entropy for the k steps
+                total_entropy = 0
+                for logprobs_dict in logprobs_dicts:
+                    logprobs = [inner_logprob.logprob for inner_logprob in logprobs_dict.values()]
+                    probs = [math.exp(logprob) for logprob in logprobs]
+                    probs_sum = sum(probs)
+                    normalized_probs = [p / probs_sum for p in probs]
+                    step_entropy = -sum(
+                        p * math.log2(p) if p > 0 else 0 for p in normalized_probs
+                    )
+                    total_entropy += step_entropy
+
+                leaf.entropy_history.append(total_entropy)
+
+                # Entropy spike detection logic
+                if len(leaf.entropy_history) > 30:
+                    ewma = self.calculate_ewma(leaf.entropy_history, alpha)
+                    std_entropy = self.calculate_std_entropy(leaf.entropy_history, ewma)
+
+                    if abs(total_entropy - ewma) > 2 * std_entropy:
+                        # Entropy spike detected, branch out
+                        spike_count += 1
+                        for _ in range(beam_width):
+                            new_text = leaf.text + generated_text
+                            new_input_ids = leaf.input_ids + self.tokenizer.encode(generated_text)
+                            new_node = self.TreeNode(
+                                new_text,
+                                new_input_ids,
+                                leaf.entropy_history.copy()
+                            )
+                            leaf.children.append(new_node)
+                        new_leaves.extend(leaf.children)
+                    else:
+                        # No spike, continue with this leaf
+                        leaf.text += generated_text
+                        leaf.input_ids += self.tokenizer.encode(generated_text)
+                        new_leaves.append(leaf)
+                else:
+                    # Not enough history, continue with this leaf
+                    leaf.text += generated_text
+                    leaf.input_ids += self.tokenizer.encode(generated_text)
+                    new_leaves.append(leaf)
+
+            leaves = sorted(new_leaves, key=lambda x: x.total_entropy)[:beam_width]
+
+            if all(self.tokenizer.eos_token in leaf.text for leaf in leaves):
+                break
+
+        total_tokens = sum(len(leaf.input_ids) - len(input_ids) for leaf in leaves)
+        spike_percentage = (
+            (spike_count / (total_tokens // k_steps)) * 100 if total_tokens > 0 else 0
+        )
+
+        # print(
+        #     f"Percentage of spikes: {spike_percentage:.2f}% "
+        #     f"({spike_count} spikes / {total_tokens // k_steps} sequences)"
+        # )
+
+        # print(min(leaves, key=lambda x: x.total_entropy).text)
+        # exit()
+
+        return min(leaves, key=lambda x: x.total_entropy).text
+
+
